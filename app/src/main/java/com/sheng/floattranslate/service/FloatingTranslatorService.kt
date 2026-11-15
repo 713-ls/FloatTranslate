@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.Handler
@@ -80,7 +81,12 @@ class FloatingTranslatorService : Service() {
             .setContentText("单击翻译全屏 | 长按切换英/中 | 双击切换节点/识图")
             .setSmallIcon(android.R.drawable.ic_menu_search)
             .build()
-        startForeground(1002, notification)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(1002, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(1002, notification)
+        }
     }
 
     private fun overlayWindowType(): Int {
@@ -118,7 +124,6 @@ class FloatingTranslatorService : Service() {
 
         val gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-                // 单击悬浮球：如果已有译文层则关闭，否则立即全屏翻译
                 if (activeOverlay != null) {
                     removeTranslationOverlay()
                 } else {
@@ -128,7 +133,6 @@ class FloatingTranslatorService : Service() {
             }
 
             override fun onDoubleTap(e: MotionEvent): Boolean {
-                // 双击悬浮球：切换 节点读词 / 全屏识图
                 captureMode = captureMode.toggle()
                 updateBubbleLabels()
                 Toast.makeText(
@@ -141,7 +145,6 @@ class FloatingTranslatorService : Service() {
 
             override fun onLongPress(e: MotionEvent) {
                 if (!isDragging) {
-                    // 长按悬浮球：切换 英→中 / 中→英
                     direction = direction.toggle()
                     updateBubbleLabels()
                     Toast.makeText(
@@ -187,30 +190,32 @@ class FloatingTranslatorService : Service() {
         tvBubbleMode.text = captureMode.shortLabel
     }
 
-    /**
-     * 点击悬浮球后直接自动读取全屏或自动全屏截图翻译，绝不弹出输入框。
-     */
     private fun triggerFullScreenTranslate() {
         if (isBusy) return
+        val acc = NodeAccessibilityService.instance
+        if (acc == null) {
+            Toast.makeText(
+                this,
+                "请先在系统设置中开启「FloatTranslate 全屏自动取词」无障碍服务（若置灰请先在应用信息右上角点『允许受限制的设置』）",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+
         isBusy = true
         removeTranslationOverlay()
 
         val isEnToZh = (direction == TranslateDirection.EN_TO_ZH)
         tvBubbleMode.text = "翻译中"
 
-        // 1. 节点读词模式优先读取无障碍节点；若当前是 PDF/图片导致节点为空，自动无缝降级到全屏截图 OCR
         if (captureMode == CaptureMode.NODE) {
-            val acc = NodeAccessibilityService.instance
-            if (acc != null) {
-                val nodeBlocks = acc.collectScreenTextBlocks(isEnToZh)
-                if (nodeBlocks.isNotEmpty()) {
-                    translateAndRenderBlocks(nodeBlocks, "${direction.shortLabel}·节点")
-                    return
-                }
+            val nodeBlocks = acc.collectScreenTextBlocks(isEnToZh)
+            if (nodeBlocks.isNotEmpty()) {
+                translateAndRenderBlocks(nodeBlocks, "${direction.shortLabel}·节点")
+                return
             }
         }
 
-        // 2. 识图模式（或节点为空时自动兜底）：隐藏悬浮球 -> 自动截取整屏 -> ML Kit 识别 -> 原位覆盖译文
         bubbleView.visibility = View.INVISIBLE
         mainHandler.postDelayed({
             ocrManager.captureFullScreenAndRecognize(

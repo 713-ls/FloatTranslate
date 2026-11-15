@@ -22,7 +22,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="6dp"
-            android:text="• 单击悬浮球：自动读取/自动全屏截图，直接在原文字位置覆盖显示译文（无弹窗、无需输入）
+            android:text="• 单击悬浮球：自动读取/自动全屏截图，直接在原文字位置覆盖显示译文
 • 长按悬浮球：切换「英→中 / 中→英」
 • 双击悬浮球：切换「节点读词 / 全屏识图」"
             android:textColor="#374151"
@@ -39,10 +39,18 @@
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="1. 权限与启动（首次开启一次即可）"
+                android:text="1. 权限与无障碍解锁（首次必看）"
                 android:textColor="#111827"
                 android:textSize="16sp"
                 android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="提示：Android 13/14/15 对非应用商店安装的 APK 默认锁住无障碍开关（提示无法运行/受限制）。请先点②尝试开启一次，再点③进入应用信息，点右上角「⋮」选择「允许受限制的设置」，然后再点②就能正常开启了！"
+                android:textColor="#B45309"
+                android:textSize="12sp" />
 
             <Button
                 android:id="@+id/btnOverlayPerm"
@@ -56,14 +64,14 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="② 开启无障碍服务（推荐：零弹窗直接读全屏节点+安卓11以上免授权静默截屏）" />
+                android:text="② 开启无障碍服务（读全屏节点 + 自动全屏截图）" />
 
             <Button
-                android:id="@+id/btnScreenCapturePerm"
+                android:id="@+id/btnAppInfo"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="③ 备用：授予全屏截图权限（仅未开无障碍时使用）" />
+                android:text="③ 打开应用详情（解锁右上角「允许受限制的设置」）" />
 
             <Button
                 android:id="@+id/btnToggleFloating"

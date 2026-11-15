@@ -1,9 +1,6 @@
 package com.sheng.floattranslate.ui
 
-import android.app.Activity
-import android.content.Context
 import android.content.Intent
-import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -15,28 +12,14 @@ import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.Toast
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import com.sheng.floattranslate.R
-import com.sheng.floattranslate.ocr.ScreenOcrManager
 import com.sheng.floattranslate.service.FloatingTranslatorService
 import com.sheng.floattranslate.util.PrefsManager
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var prefs: PrefsManager
-
-    private val screenCaptureLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == Activity.RESULT_OK && result.data != null) {
-            ScreenOcrManager.resultCode = result.resultCode
-            ScreenOcrManager.resultData = result.data
-            Toast.makeText(this, "全屏截图权限已就绪", Toast.LENGTH_SHORT).show()
-        } else {
-            Toast.makeText(this, "未授予截图权限（若已开启无障碍服务，Android 11+ 依然可直接全屏截图）", Toast.LENGTH_SHORT).show()
-        }
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -46,7 +29,7 @@ class MainActivity : AppCompatActivity() {
 
         val btnOverlay = findViewById<Button>(R.id.btnOverlayPerm)
         val btnAccessibility = findViewById<Button>(R.id.btnAccessibilityPerm)
-        val btnScreenCapture = findViewById<Button>(R.id.btnScreenCapturePerm)
+        val btnAppInfo = findViewById<Button>(R.id.btnAppInfo)
         val btnToggleFloating = findViewById<Button>(R.id.btnToggleFloating)
 
         val rgEngine = findViewById<RadioGroup>(R.id.rgEngine)
@@ -98,9 +81,13 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
 
-        btnScreenCapture.setOnClickListener {
-            val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            screenCaptureLauncher.launch(mpm.createScreenCaptureIntent())
+        btnAppInfo.setOnClickListener {
+            startActivity(
+                Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:$packageName")
+                )
+            )
         }
 
         btnToggleFloating.setOnClickListener {
