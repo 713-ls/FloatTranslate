@@ -1,12 +1,19 @@
 package com.sheng.floattranslate.data
 
 import android.content.Context
+import android.util.LruCache
 import com.sheng.floattranslate.model.ScreenTextBlock
 import com.sheng.floattranslate.model.TranslateDirection
 import com.sheng.floattranslate.util.PrefsManager
 import com.sheng.floattranslate.util.TextCleaner
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import okhttp3.Dispatcher
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -19,14 +26,29 @@ import java.util.concurrent.TimeUnit
 class TranslationRepository(context: Context) {
     private val db = TranslationDbHelper(context)
     private val prefs = PrefsManager(context)
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
-        .build()
 
-    /**
-     * 批量翻译整屏文字块：优先命中本地缓存，未命中的合并为一次联网请求，速度极快。
-     */
+    companion object {
+        private val memCache = LruCache<String, String>(500)
+        @Volatile
+        private var gtxBlockedUntil: Long = 0L
+
+        private val fastClient = OkHttpClient.Builder()
+            .dispatcher(Dispatcher().apply {
+                maxRequests = 64
+                maxRequestsPerHost = 32
+            })
+            .connectTimeout(2500, TimeUnit.MILLISECONDS)
+            .readTimeout(4500, TimeUnit.MILLISECONDS)
+            .build()
+
+        private val customApiClient = OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private val concurrencyGate = Semaphore(12)
+
     suspend fun translateBlocks(
         blocks: List<ScreenTextBlock>,
         direction: TranslateDirection
@@ -37,42 +59,76 @@ class TranslationRepository(context: Context) {
         val uncachedIndices = mutableListOf<Int>()
         val cleanedInputs = mutableListOf<String>()
 
+        // 去重映射：相同文本在一屏内只请求一次
+        val uniqueInputs = LinkedHashMap<String, MutableList<Int>>()
+
         blocks.forEachIndexed { idx, block ->
             val cleaned = TextCleaner.cleanForTranslation(block.originalText)
             val key = "${direction.name}:$engineTag:$cleaned"
-            val cached = db.get(key)
+            val cached = memCache.get(key) ?: db.get(key)?.also { memCache.put(key, it) }
             if (cached != null) {
                 block.translatedText = cached
             } else {
-                uncachedIndices.add(idx)
-                cleanedInputs.add(cleaned)
+                val listForText = uniqueInputs.getOrPut(cleaned) { mutableListOf() }
+                if (listForText.isEmpty()) {
+                    uncachedIndices.add(idx)
+                    cleanedInputs.add(cleaned)
+                }
+                listForText.add(idx)
             }
         }
 
-        if (uncachedIndices.isNotEmpty()) {
-            val translatedList = if (engineTag == "custom") {
+        if (cleanedInputs.isNotEmpty()) {
+            val translatedUnique = if (engineTag == "custom") {
                 batchTranslateCustom(cleanedInputs, direction)
             } else {
-                batchTranslateFree(cleanedInputs, direction)
+                batchTranslateFreeFast(cleanedInputs, direction)
             }
 
-            uncachedIndices.forEachIndexed { i, blockIdx ->
-                val trans = translatedList.getOrNull(i)?.trim().orEmpty()
-                val finalTrans = if (trans.isNotEmpty()) trans else blocks[blockIdx].originalText
-                blocks[blockIdx].translatedText = finalTrans
-                val key = "${direction.name}:$engineTag:${cleanedInputs[i]}"
-                if (trans.isNotEmpty()) db.put(key, finalTrans)
+            cleanedInputs.forEachIndexed { i, cleaned ->
+                val trans = translatedUnique.getOrNull(i)?.trim().orEmpty()
+                val targetBlockIndices = uniqueInputs[cleaned].orEmpty()
+                for (bIdx in targetBlockIndices) {
+                    val finalTrans = if (trans.isNotEmpty()) trans else blocks[bIdx].originalText
+                    blocks[bIdx].translatedText = finalTrans
+                }
+                if (trans.isNotEmpty()) {
+                    val key = "${direction.name}:$engineTag:$cleaned"
+                    memCache.put(key, trans)
+                    db.put(key, trans)
+                }
             }
         }
 
         blocks
     }
 
-    private fun batchTranslateFree(lines: List<String>, direction: TranslateDirection): List<String> {
-        // 将多行用换行符拼接，一次请求完成整屏翻译
-        val joined = lines.joinToString("\n")
+    private suspend fun batchTranslateFreeFast(
+        lines: List<String>,
+        direction: TranslateDirection
+    ): List<String> = coroutineScope {
+        // 1. 若 Google GTX 未处于熔断期，优先用编号锚点一次性批量翻译整屏（约 0.2~0.4s）
+        if (System.currentTimeMillis() > gtxBlockedUntil) {
+            val gtxResult = tryBatchGoogleGtx(lines, direction)
+            if (gtxResult != null) return@coroutineScope gtxResult
+        }
+
+        // 2. 若 Google GTX 超时或不可达，立即走全并发 MyMemory 请求（所有词条同时发出，耗时约 0.4~0.7s）
+        lines.map { line ->
+            async(Dispatchers.IO) {
+                concurrencyGate.withPermit {
+                    singleMyMemory(line, direction)
+                }
+            }
+        }.awaitAll()
+    }
+
+    private fun tryBatchGoogleGtx(lines: List<String>, direction: TranslateDirection): List<String>? {
         return try {
-            val encoded = URLEncoder.encode(joined, "UTF-8")
+            // 使用 [1] [2] 编号锚点拼接，彻底解决返回文本换行符错位导致整批作废的问题
+            val payloadText = lines.mapIndexed { idx, s -> "[${idx + 1}] ${s.replace("\n", " ")}" }
+                .joinToString("\n")
+            val encoded = URLEncoder.encode(payloadText, "UTF-8")
             val url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=${direction.fromLang}&tl=${direction.toLang}&dt=t&q=$encoded"
             val req = Request.Builder()
                 .url(url)
@@ -80,50 +136,70 @@ class TranslationRepository(context: Context) {
                 .get()
                 .build()
 
-            val bodyStr = client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) "" else resp.body?.string().orEmpty()
+            val bodyStr = fastClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                resp.body?.string().orEmpty()
+            }
+            if (bodyStr.isEmpty()) return null
+
+            val outer = JSONArray(bodyStr).getJSONArray(0)
+            val combined = StringBuilder()
+            for (i in 0 until outer.length()) {
+                combined.append(outer.getJSONArray(i).optString(0))
             }
 
-            if (bodyStr.isNotEmpty()) {
-                val outer = JSONArray(bodyStr).getJSONArray(0)
-                val sb = StringBuilder()
-                for (i in 0 until outer.length()) {
-                    val seg = outer.getJSONArray(i).optString(0)
-                    sb.append(seg)
-                }
-                val split = sb.toString().split("\n")
-                if (split.size == lines.size) {
-                    return split
-                }
-            }
-            // Fallback to MyMemory per-chunk if Google GTX is unreachable or line count mismatched
-            lines.map { singleMyMemory(it, direction) }
+            parseNumberedOutput(combined.toString(), lines)
         } catch (_: Exception) {
-            lines.map { singleMyMemory(it, direction) }
+            // 触发熔断：5 分钟内跳过 Google GTX，后续点击不再白等 2.5 秒超时
+            gtxBlockedUntil = System.currentTimeMillis() + 5 * 60 * 1000L
+            null
         }
+    }
+
+    private fun parseNumberedOutput(rawOutput: String, originalLines: List<String>): List<String>? {
+        val resultMap = HashMap<Int, String>()
+        val regex = Regex("\\[(\\d+)\\]\\s*([^\\[]*)")
+        regex.findAll(rawOutput).forEach { match ->
+            val idx = match.groupValues[1].toIntOrNull()
+            val text = match.groupValues[2].trim()
+            if (idx != null && text.isNotEmpty()) {
+                resultMap[idx - 1] = text
+            }
+        }
+        if (resultMap.isEmpty()) return null
+        return originalLines.indices.map { i -> resultMap[i] ?: originalLines[i] }
     }
 
     private fun singleMyMemory(text: String, direction: TranslateDirection): String {
         return try {
-            val encoded = URLEncoder.encode(text.take(250), "UTF-8")
+            val encoded = URLEncoder.encode(text.take(220), "UTF-8")
             val url = "https://api.mymemory.translated.net/get?q=$encoded&langpair=${direction.fromLang}|${direction.toLang}"
             val req = Request.Builder().url(url).get().build()
-            val bodyStr = client.newCall(req).execute().use { resp ->
+            val bodyStr = fastClient.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return text
                 resp.body?.string().orEmpty()
             }
-            JSONObject(bodyStr).optJSONObject("responseData")?.optString("translatedText") ?: text
+            val translated = JSONObject(bodyStr)
+                .optJSONObject("responseData")
+                ?.optString("translatedText")
+                ?.trim()
+                .orEmpty()
+            if (translated.isNotEmpty()) translated else text
         } catch (_: Exception) {
             text
         }
     }
 
-    private fun batchTranslateCustom(lines: List<String>, direction: TranslateDirection): List<String> {
+    private suspend fun batchTranslateCustom(
+        lines: List<String>,
+        direction: TranslateDirection
+    ): List<String> {
         return try {
             val endpoint = prefs.baseUrl.trimEnd('/') + "/chat/completions"
-            val numbered = lines.mapIndexed { idx, s -> "[${idx + 1}] $s" }.joinToString("\n")
+            val numbered = lines.mapIndexed { idx, s -> "[${idx + 1}] ${s.replace("\n", " ")}" }
+                .joinToString("\n")
             val targetLang = if (direction == TranslateDirection.EN_TO_ZH) "简体中文" else "英文"
-            val prompt = "请将以下按行编号的内容逐行准确翻译为$targetLang，保持相同的行号格式 [n] 输出，不要输出多余解释：\n$numbered"
+            val prompt = "请将以下编号内容逐条翻译为$targetLang，严格保持 [编号] 译文 格式，不要多余解释：\n$numbered"
 
             val payload = JSONObject().apply {
                 put("model", prefs.modelName)
@@ -143,8 +219,8 @@ class TranslationRepository(context: Context) {
                 .post(payload.toString().toRequestBody("application/json".toMediaType()))
                 .build()
 
-            val bodyStr = client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return batchTranslateFree(lines, direction)
+            val bodyStr = customApiClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return batchTranslateFreeFast(lines, direction)
                 resp.body?.string().orEmpty()
             }
             val content = JSONObject(bodyStr)
@@ -153,17 +229,9 @@ class TranslationRepository(context: Context) {
                 .getJSONObject("message")
                 .getString("content")
 
-            val resultMap = mutableMapOf<Int, String>()
-            content.lines().forEach { line ->
-                val m = Regex("^\\[(\\d+)\\]\\s*(.*)$").find(line.trim())
-                if (m != null) {
-                    val idx = m.groupValues[1].toIntOrNull()
-                    if (idx != null) resultMap[idx - 1] = m.groupValues[2]
-                }
-            }
-            lines.indices.map { i -> resultMap[i] ?: lines[i] }
+            parseNumberedOutput(content, lines) ?: batchTranslateFreeFast(lines, direction)
         } catch (_: Exception) {
-            batchTranslateFree(lines, direction)
+            batchTranslateFreeFast(lines, direction)
         }
     }
 }

@@ -231,7 +231,7 @@ class FloatingTranslatorService : Service() {
                     Toast.makeText(this, errMsg, Toast.LENGTH_SHORT).show()
                 }
             )
-        }, 80)
+        }, 35)
     }
 
     private fun translateAndRenderBlocks(blocks: List<ScreenTextBlock>, modeTag: String) {
