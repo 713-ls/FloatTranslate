@@ -1,1 +1,5 @@
-# Keep ML Kit & OkHttp rules default
+-dontwarn okhttp3.**
+-dontwarn okio.**
+-keep class com.google.mlkit.** { *; }
+-keep class com.google.android.gms.** { *; }
+-keep class com.sheng.floattranslate.** { *; }

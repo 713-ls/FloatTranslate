@@ -1,8 +1,8 @@
 package com.sheng.floattranslate.data
 
 import android.content.Context
+import com.sheng.floattranslate.model.ScreenTextBlock
 import com.sheng.floattranslate.model.TranslateDirection
-import com.sheng.floattranslate.model.TranslationResult
 import com.sheng.floattranslate.util.PrefsManager
 import com.sheng.floattranslate.util.TextCleaner
 import kotlinx.coroutines.Dispatchers
@@ -20,111 +20,114 @@ class TranslationRepository(context: Context) {
     private val db = TranslationDbHelper(context)
     private val prefs = PrefsManager(context)
     private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
         .build()
 
-    suspend fun translate(rawText: String, direction: TranslateDirection): TranslationResult =
-        withContext(Dispatchers.IO) {
-            val cleaned = TextCleaner.cleanForTranslation(rawText)
-            if (cleaned.isEmpty()) {
-                return@withContext TranslationResult(rawText, "", "请输入或截取需要翻译的内容", null, "提示")
-            }
+    /**
+     * 批量翻译整屏文字块：优先命中本地缓存，未命中的合并为一次联网请求，速度极快。
+     */
+    suspend fun translateBlocks(
+        blocks: List<ScreenTextBlock>,
+        direction: TranslateDirection
+    ): List<ScreenTextBlock> = withContext(Dispatchers.IO) {
+        if (blocks.isEmpty()) return@withContext emptyList()
 
-            val engineTag = if (prefs.useCustomApi && prefs.apiKey.isNotEmpty()) "custom" else "free"
-            val cacheKey = "${direction.name}:$engineTag:$cleaned"
-            db.getCached(cacheKey)?.let { return@withContext it }
+        val engineTag = if (prefs.useCustomApi && prefs.apiKey.isNotEmpty()) "custom" else "free"
+        val uncachedIndices = mutableListOf<Int>()
+        val cleanedInputs = mutableListOf<String>()
 
-            val result = if (engineTag == "custom") {
-                translateWithCustomApi(cleaned, direction)
+        blocks.forEachIndexed { idx, block ->
+            val cleaned = TextCleaner.cleanForTranslation(block.originalText)
+            val key = "${direction.name}:$engineTag:$cleaned"
+            val cached = db.get(key)
+            if (cached != null) {
+                block.translatedText = cached
             } else {
-                translateWithFreeApi(cleaned, direction)
+                uncachedIndices.add(idx)
+                cleanedInputs.add(cleaned)
             }
-
-            if (!result.translatedText.startsWith("请求失败")) {
-                db.save(cacheKey, result)
-            }
-            result
         }
 
-    private fun translateWithFreeApi(text: String, direction: TranslateDirection): TranslationResult {
+        if (uncachedIndices.isNotEmpty()) {
+            val translatedList = if (engineTag == "custom") {
+                batchTranslateCustom(cleanedInputs, direction)
+            } else {
+                batchTranslateFree(cleanedInputs, direction)
+            }
+
+            uncachedIndices.forEachIndexed { i, blockIdx ->
+                val trans = translatedList.getOrNull(i)?.trim().orEmpty()
+                val finalTrans = if (trans.isNotEmpty()) trans else blocks[blockIdx].originalText
+                blocks[blockIdx].translatedText = finalTrans
+                val key = "${direction.name}:$engineTag:${cleanedInputs[i]}"
+                if (trans.isNotEmpty()) db.put(key, finalTrans)
+            }
+        }
+
+        blocks
+    }
+
+    private fun batchTranslateFree(lines: List<String>, direction: TranslateDirection): List<String> {
+        // 将多行用换行符拼接，一次请求完成整屏翻译
+        val joined = lines.joinToString("\n")
         return try {
-            val encoded = URLEncoder.encode(text, "UTF-8")
+            val encoded = URLEncoder.encode(joined, "UTF-8")
+            val url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=${direction.fromLang}&tl=${direction.toLang}&dt=t&q=$encoded"
+            val req = Request.Builder()
+                .url(url)
+                .header("User-Agent", "Mozilla/5.0")
+                .get()
+                .build()
+
+            val bodyStr = client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) "" else resp.body?.string().orEmpty()
+            }
+
+            if (bodyStr.isNotEmpty()) {
+                val outer = JSONArray(bodyStr).getJSONArray(0)
+                val sb = StringBuilder()
+                for (i in 0 until outer.length()) {
+                    val seg = outer.getJSONArray(i).optString(0)
+                    sb.append(seg)
+                }
+                val split = sb.toString().split("\n")
+                if (split.size == lines.size) {
+                    return split
+                }
+            }
+            // Fallback to MyMemory per-chunk if Google GTX is unreachable or line count mismatched
+            lines.map { singleMyMemory(it, direction) }
+        } catch (_: Exception) {
+            lines.map { singleMyMemory(it, direction) }
+        }
+    }
+
+    private fun singleMyMemory(text: String, direction: TranslateDirection): String {
+        return try {
+            val encoded = URLEncoder.encode(text.take(250), "UTF-8")
             val url = "https://api.mymemory.translated.net/get?q=$encoded&langpair=${direction.fromLang}|${direction.toLang}"
             val req = Request.Builder().url(url).get().build()
             val bodyStr = client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return TranslationResult(text, text, "请求失败: HTTP ${resp.code}", null, "免费接口")
+                if (!resp.isSuccessful) return text
                 resp.body?.string().orEmpty()
             }
-            val json = JSONObject(bodyStr)
-            val translated = json.optJSONObject("responseData")?.optString("translatedText") ?: "未获取到翻译结果"
-
-            var phonetic: String? = null
-            var dictDetail = ""
-            if (direction == TranslateDirection.EN_TO_ZH && !text.contains(" ") && text.length <= 30) {
-                val dictInfo = fetchEnglishDictionary(text.lowercase())
-                phonetic = dictInfo.first
-                if (dictInfo.second.isNotEmpty()) {
-                    dictDetail = "\n\n【词典释义】\n${dictInfo.second}"
-                }
-            }
-
-            TranslationResult(
-                query = text,
-                cleanedQuery = text,
-                translatedText = translated + dictDetail,
-                phonetic = phonetic,
-                sourceLabel = "免费接口 (MyMemory)"
-            )
-        } catch (e: Exception) {
-            TranslationResult(text, text, "请求失败: ${e.message}", null, "免费接口")
-        }
-    }
-
-    private fun fetchEnglishDictionary(word: String): Pair<String?, String> {
-        return try {
-            val req = Request.Builder()
-                .url("https://api.dictionaryapi.dev/api/v2/entries/en/${URLEncoder.encode(word, "UTF-8")}")
-                .get()
-                .build()
-            val bodyStr = client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return null to ""
-                resp.body?.string().orEmpty()
-            }
-            val arr = JSONArray(bodyStr)
-            val first = arr.getJSONObject(0)
-            val phonetic = first.optString("phonetic").takeIf { it.isNotEmpty() }
-            val meanings = first.optJSONArray("meanings")
-            val sb = StringBuilder()
-            if (meanings != null) {
-                for (i in 0 until minOf(2, meanings.length())) {
-                    val m = meanings.getJSONObject(i)
-                    val pos = m.optString("partOfSpeech")
-                    val defs = m.optJSONArray("definitions")
-                    val defText = defs?.optJSONObject(0)?.optString("definition").orEmpty()
-                    if (defText.isNotEmpty()) {
-                        sb.append("• [$pos] $defText\n")
-                    }
-                }
-            }
-            phonetic to sb.toString().trim()
+            JSONObject(bodyStr).optJSONObject("responseData")?.optString("translatedText") ?: text
         } catch (_: Exception) {
-            null to ""
+            text
         }
     }
 
-    private fun translateWithCustomApi(text: String, direction: TranslateDirection): TranslationResult {
+    private fun batchTranslateCustom(lines: List<String>, direction: TranslateDirection): List<String> {
         return try {
             val endpoint = prefs.baseUrl.trimEnd('/') + "/chat/completions"
-            val prompt = if (direction == TranslateDirection.EN_TO_ZH) {
-                "请将以下英文内容准确翻译为中文（若包含编程/机器人/工程术语请保留专业准确度，并简要标注关键术语）：\n$text"
-            } else {
-                "请将以下中文内容准确翻译为地道英文（若为技术/学术表达请给出最贴切的英文术语或句式）：\n$text"
-            }
+            val numbered = lines.mapIndexed { idx, s -> "[${idx + 1}] $s" }.joinToString("\n")
+            val targetLang = if (direction == TranslateDirection.EN_TO_ZH) "简体中文" else "英文"
+            val prompt = "请将以下按行编号的内容逐行准确翻译为$targetLang，保持相同的行号格式 [n] 输出，不要输出多余解释：\n$numbered"
 
             val payload = JSONObject().apply {
                 put("model", prefs.modelName)
-                put("temperature", 0.2)
+                put("temperature", 0.1)
                 put("messages", JSONArray().apply {
                     put(JSONObject().apply {
                         put("role", "user")
@@ -141,26 +144,26 @@ class TranslationRepository(context: Context) {
                 .build()
 
             val bodyStr = client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return TranslationResult(text, text, "请求失败: HTTP ${resp.code}", null, "自定义 API")
+                if (!resp.isSuccessful) return batchTranslateFree(lines, direction)
                 resp.body?.string().orEmpty()
             }
-
-            val json = JSONObject(bodyStr)
-            val content = json.getJSONArray("choices")
+            val content = JSONObject(bodyStr)
+                .getJSONArray("choices")
                 .getJSONObject(0)
                 .getJSONObject("message")
                 .getString("content")
-                .trim()
 
-            TranslationResult(
-                query = text,
-                cleanedQuery = text,
-                translatedText = content,
-                phonetic = null,
-                sourceLabel = "自定义 API (${prefs.modelName})"
-            )
-        } catch (e: Exception) {
-            TranslationResult(text, text, "请求失败: ${e.message}", null, "自定义 API")
+            val resultMap = mutableMapOf<Int, String>()
+            content.lines().forEach { line ->
+                val m = Regex("^\\[(\\d+)\\]\\s*(.*)$").find(line.trim())
+                if (m != null) {
+                    val idx = m.groupValues[1].toIntOrNull()
+                    if (idx != null) resultMap[idx - 1] = m.groupValues[2]
+                }
+            }
+            lines.indices.map { i -> resultMap[i] ?: lines[i] }
+        } catch (_: Exception) {
+            batchTranslateFree(lines, direction)
         }
     }
 }

@@ -4,75 +4,37 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
-import com.sheng.floattranslate.model.TranslationResult
 
 class TranslationDbHelper(context: Context) :
-    SQLiteOpenHelper(context, "float_translate.db", null, 1) {
+    SQLiteOpenHelper(context, "float_translate_v2.db", null, 1) {
 
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
-            """
-            CREATE TABLE translations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                query_key TEXT UNIQUE,
-                cleaned_query TEXT,
-                translated_text TEXT,
-                phonetic TEXT,
-                source_label TEXT,
-                created_at INTEGER
-            )
-            """.trimIndent()
+            "CREATE TABLE cache (cache_key TEXT PRIMARY KEY, translated TEXT, created_at INTEGER)"
         )
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        db.execSQL("DROP TABLE IF EXISTS translations")
+        db.execSQL("DROP TABLE IF EXISTS cache")
         onCreate(db)
     }
 
-    fun getCached(key: String): TranslationResult? {
-        val db = readableDatabase
-        db.rawQuery(
-            "SELECT cleaned_query, translated_text, phonetic, source_label FROM translations WHERE query_key = ? LIMIT 1",
+    fun get(key: String): String? {
+        readableDatabase.rawQuery(
+            "SELECT translated FROM cache WHERE cache_key = ? LIMIT 1",
             arrayOf(key)
-        ).use { cursor ->
-            if (cursor.moveToFirst()) {
-                return TranslationResult(
-                    query = key,
-                    cleanedQuery = cursor.getString(0),
-                    translatedText = cursor.getString(1),
-                    phonetic = cursor.getString(2),
-                    sourceLabel = "本地缓存 (${cursor.getString(3)})"
-                )
-            }
+        ).use { c ->
+            if (c.moveToFirst()) return c.getString(0)
         }
         return null
     }
 
-    fun save(key: String, result: TranslationResult) {
-        val db = writableDatabase
-        val values = ContentValues().apply {
-            put("query_key", key)
-            put("cleaned_query", result.cleanedQuery)
-            put("translated_text", result.translatedText)
-            put("phonetic", result.phonetic)
-            put("source_label", result.sourceLabel)
+    fun put(key: String, translated: String) {
+        val cv = ContentValues().apply {
+            put("cache_key", key)
+            put("translated", translated)
             put("created_at", System.currentTimeMillis())
         }
-        db.insertWithOnConflict("translations", null, values, SQLiteDatabase.CONFLICT_REPLACE)
-    }
-
-    fun getRecentHistory(limit: Int = 10): List<Pair<String, String>> {
-        val list = mutableListOf<Pair<String, String>>()
-        val db = readableDatabase
-        db.rawQuery(
-            "SELECT cleaned_query, translated_text FROM translations ORDER BY created_at DESC LIMIT ?",
-            arrayOf(limit.toString())
-        ).use { cursor ->
-            while (cursor.moveToNext()) {
-                list.add(cursor.getString(0) to cursor.getString(1))
-            }
-        }
-        return list
+        writableDatabase.insertWithOnConflict("cache", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
     }
 }

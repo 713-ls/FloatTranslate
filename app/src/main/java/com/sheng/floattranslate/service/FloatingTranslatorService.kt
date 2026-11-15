@@ -4,33 +4,34 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.PixelFormat
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.view.GestureDetector
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
-import android.widget.Button
-import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
 import com.sheng.floattranslate.R
 import com.sheng.floattranslate.data.TranslationRepository
 import com.sheng.floattranslate.model.CaptureMode
+import com.sheng.floattranslate.model.ScreenTextBlock
 import com.sheng.floattranslate.model.TranslateDirection
-import com.sheng.floattranslate.ocr.RegionOverlayView
+import com.sheng.floattranslate.ocr.FullScreenTranslationOverlay
 import com.sheng.floattranslate.ocr.ScreenOcrManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlin.math.abs
 
 class FloatingTranslatorService : Service() {
 
@@ -41,17 +42,19 @@ class FloatingTranslatorService : Service() {
 
     private lateinit var windowManager: WindowManager
     private lateinit var bubbleView: View
-    private lateinit var panelView: View
+    private lateinit var tvBubbleDir: TextView
+    private lateinit var tvBubbleMode: TextView
     private lateinit var bubbleParams: WindowManager.LayoutParams
-    private lateinit var panelParams: WindowManager.LayoutParams
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var repository: TranslationRepository
     private lateinit var ocrManager: ScreenOcrManager
 
     private var direction = TranslateDirection.EN_TO_ZH
     private var captureMode = CaptureMode.NODE
-    private var regionOverlay: RegionOverlayView? = null
+    private var activeOverlay: FullScreenTranslationOverlay? = null
+    private var isBusy = false
 
     override fun onCreate() {
         super.onCreate()
@@ -62,23 +65,22 @@ class FloatingTranslatorService : Service() {
 
         startForegroundNotification()
         initBubbleView()
-        initPanelView()
     }
 
     private fun startForegroundNotification() {
-        val channelId = "float_translate_channel"
+        val channelId = "float_translate_v2"
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             nm.createNotificationChannel(
-                NotificationChannel(channelId, "FloatTranslate 悬浮服务", NotificationManager.IMPORTANCE_LOW)
+                NotificationChannel(channelId, "FloatTranslate 全屏翻译", NotificationManager.IMPORTANCE_LOW)
             )
         }
         val notification = Notification.Builder(this, channelId)
             .setContentTitle("FloatTranslate 运行中")
-            .setContentText("点击悬浮球即可取词翻译")
+            .setContentText("单击翻译全屏 | 长按切换英/中 | 双击切换节点/识图")
             .setSmallIcon(android.R.drawable.ic_menu_search)
             .build()
-        startForeground(1001, notification)
+        startForeground(1002, notification)
     }
 
     private fun overlayWindowType(): Int {
@@ -92,6 +94,10 @@ class FloatingTranslatorService : Service() {
 
     private fun initBubbleView() {
         bubbleView = LayoutInflater.from(this).inflate(R.layout.layout_floating_bubble, null)
+        tvBubbleDir = bubbleView.findViewById(R.id.tvBubbleDir)
+        tvBubbleMode = bubbleView.findViewById(R.id.tvBubbleMode)
+        updateBubbleLabels()
+
         bubbleParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -100,200 +106,169 @@ class FloatingTranslatorService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 40
-            y = 300
+            x = 24
+            y = 420
         }
 
         var initX = 0
         var initY = 0
-        var touchX = 0f
-        var touchY = 0f
-        var moved = false
+        var downRawX = 0f
+        var downRawY = 0f
+        var isDragging = false
+
+        val gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                // 单击悬浮球：如果已有译文层则关闭，否则立即全屏翻译
+                if (activeOverlay != null) {
+                    removeTranslationOverlay()
+                } else {
+                    triggerFullScreenTranslate()
+                }
+                return true
+            }
+
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                // 双击悬浮球：切换 节点读词 / 全屏识图
+                captureMode = captureMode.toggle()
+                updateBubbleLabels()
+                Toast.makeText(
+                    this@FloatingTranslatorService,
+                    "已切换为：${captureMode.shortLabel}全屏模式",
+                    Toast.LENGTH_SHORT
+                ).show()
+                return true
+            }
+
+            override fun onLongPress(e: MotionEvent) {
+                if (!isDragging) {
+                    // 长按悬浮球：切换 英→中 / 中→英
+                    direction = direction.toggle()
+                    updateBubbleLabels()
+                    Toast.makeText(
+                        this@FloatingTranslatorService,
+                        "已切换方向：${direction.shortLabel}",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        })
 
         bubbleView.setOnTouchListener { _, event ->
+            gestureDetector.onTouchEvent(event)
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
                     initX = bubbleParams.x
                     initY = bubbleParams.y
-                    touchX = event.rawX
-                    touchY = event.rawY
-                    moved = false
+                    downRawX = event.rawX
+                    downRawY = event.rawY
+                    isDragging = false
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    val dx = (event.rawX - touchX).toInt()
-                    val dy = (event.rawY - touchY).toInt()
-                    if (kotlin.math.abs(dx) > 8 || kotlin.math.abs(dy) > 8) moved = true
-                    bubbleParams.x = initX + dx
-                    bubbleParams.y = initY + dy
-                    windowManager.updateViewLayout(bubbleView, bubbleParams)
+                    val dx = (event.rawX - downRawX).toInt()
+                    val dy = (event.rawY - downRawY).toInt()
+                    if (abs(dx) > 12 || abs(dy) > 12) {
+                        isDragging = true
+                        bubbleParams.x = initX + dx
+                        bubbleParams.y = initY + dy
+                        windowManager.updateViewLayout(bubbleView, bubbleParams)
+                    }
                     true
                 }
-                MotionEvent.ACTION_UP -> {
-                    if (!moved) showPanel()
-                    true
-                }
-                else -> false
+                else -> true
             }
         }
 
         windowManager.addView(bubbleView, bubbleParams)
     }
 
-    private fun initPanelView() {
-        panelView = LayoutInflater.from(this).inflate(R.layout.layout_floating_panel, null)
-        panelParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            overlayWindowType(),
-            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.CENTER
-        }
+    private fun updateBubbleLabels() {
+        tvBubbleDir.text = direction.shortLabel
+        tvBubbleMode.text = captureMode.shortLabel
+    }
 
-        val btnDirection = panelView.findViewById<TextView>(R.id.btnDirection)
-        val btnCaptureMode = panelView.findViewById<TextView>(R.id.btnCaptureMode)
-        val btnCollapse = panelView.findViewById<TextView>(R.id.btnCollapse)
-        val btnClose = panelView.findViewById<TextView>(R.id.btnClose)
-        val etSource = panelView.findViewById<EditText>(R.id.etSourceText)
-        val btnCapture = panelView.findViewById<Button>(R.id.btnCapture)
-        val btnTranslate = panelView.findViewById<Button>(R.id.btnTranslate)
-        val tvMeta = panelView.findViewById<TextView>(R.id.tvSourceMeta)
-        val tvResult = panelView.findViewById<TextView>(R.id.tvResult)
-        val btnCopy = panelView.findViewById<TextView>(R.id.btnCopyResult)
+    /**
+     * 点击悬浮球后直接自动读取全屏或自动全屏截图翻译，绝不弹出输入框。
+     */
+    private fun triggerFullScreenTranslate() {
+        if (isBusy) return
+        isBusy = true
+        removeTranslationOverlay()
 
-        btnDirection.setOnClickListener {
-            direction = direction.toggle()
-            btnDirection.text = direction.label
-        }
+        val isEnToZh = (direction == TranslateDirection.EN_TO_ZH)
+        tvBubbleMode.text = "翻译中"
 
-        btnCaptureMode.setOnClickListener {
-            captureMode = captureMode.toggle()
-            btnCaptureMode.text = captureMode.label
-            btnCapture.text = if (captureMode == CaptureMode.NODE) "读取节点" else "框选识图"
-        }
-
-        btnCollapse.setOnClickListener { hidePanel() }
-        btnClose.setOnClickListener { stopSelf() }
-
-        btnCapture.setOnClickListener {
-            if (captureMode == CaptureMode.NODE) {
-                val acc = NodeAccessibilityService.instance
-                if (acc == null) {
-                    tvResult.text = "请先在主界面开启「无障碍节点取词」服务"
-                    return@setOnClickListener
+        // 1. 节点读词模式优先读取无障碍节点；若当前是 PDF/图片导致节点为空，自动无缝降级到全屏截图 OCR
+        if (captureMode == CaptureMode.NODE) {
+            val acc = NodeAccessibilityService.instance
+            if (acc != null) {
+                val nodeBlocks = acc.collectScreenTextBlocks(isEnToZh)
+                if (nodeBlocks.isNotEmpty()) {
+                    translateAndRenderBlocks(nodeBlocks, "${direction.shortLabel}·节点")
+                    return
                 }
-                val text = acc.captureCurrentPageText()
-                if (text.isEmpty()) {
-                    tvResult.text = "未读取到当前页面文本，可切换为「框选识图」"
-                } else {
-                    etSource.setText(text)
-                    performTranslate(text, tvMeta, tvResult)
-                }
-            } else {
-                startRegionOcrCapture(etSource, tvMeta, tvResult)
             }
         }
 
-        btnTranslate.setOnClickListener {
-            performTranslate(etSource.text.toString(), tvMeta, tvResult)
-        }
+        // 2. 识图模式（或节点为空时自动兜底）：隐藏悬浮球 -> 自动截取整屏 -> ML Kit 识别 -> 原位覆盖译文
+        bubbleView.visibility = View.INVISIBLE
+        mainHandler.postDelayed({
+            ocrManager.captureFullScreenAndRecognize(
+                isEnToZh = isEnToZh,
+                onSuccess = { ocrBlocks ->
+                    bubbleView.visibility = View.VISIBLE
+                    translateAndRenderBlocks(ocrBlocks, "${direction.shortLabel}·全屏识图")
+                },
+                onError = { errMsg ->
+                    bubbleView.visibility = View.VISIBLE
+                    isBusy = false
+                    updateBubbleLabels()
+                    Toast.makeText(this, errMsg, Toast.LENGTH_SHORT).show()
+                }
+            )
+        }, 80)
+    }
 
-        btnCopy.setOnClickListener {
-            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            cm.setPrimaryClip(ClipData.newPlainText("FloatTranslate", tvResult.text))
-            Toast.makeText(this, "已复制翻译结果", Toast.LENGTH_SHORT).show()
+    private fun translateAndRenderBlocks(blocks: List<ScreenTextBlock>, modeTag: String) {
+        scope.launch {
+            val translated = repository.translateBlocks(blocks, direction)
+            isBusy = false
+            updateBubbleLabels()
+            showTranslationOverlay(translated, modeTag)
         }
     }
 
-    private fun startRegionOcrCapture(etSource: EditText, tvMeta: TextView, tvResult: TextView) {
-        if (!ScreenOcrManager.hasPermission()) {
-            tvResult.text = "请先在主界面授予「截屏识图」权限"
-            return
-        }
-        hidePanel()
-        bubbleView.visibility = View.GONE
-
-        val overlayParams = WindowManager.LayoutParams(
+    private fun showTranslationOverlay(blocks: List<ScreenTextBlock>, statusHint: String) {
+        removeTranslationOverlay()
+        val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             overlayWindowType(),
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         )
-
-        regionOverlay = RegionOverlayView(
+        activeOverlay = FullScreenTranslationOverlay(
             this,
-            onRegionSelected = { rect ->
-                removeRegionOverlay()
-                ocrManager.captureAndRecognize(
-                    cropRect = rect,
-                    onResult = { recognized ->
-                        bubbleView.visibility = View.VISIBLE
-                        showPanel()
-                        etSource.setText(recognized)
-                        performTranslate(recognized, tvMeta, tvResult)
-                    },
-                    onError = { err ->
-                        bubbleView.visibility = View.VISIBLE
-                        showPanel()
-                        tvResult.text = err
-                    }
-                )
-            },
-            onCancel = {
-                removeRegionOverlay()
-                bubbleView.visibility = View.VISIBLE
-                showPanel()
-            }
+            blocks = blocks,
+            statusHint = statusHint,
+            onDismiss = { removeTranslationOverlay() }
         )
-        windowManager.addView(regionOverlay, overlayParams)
+        windowManager.addView(activeOverlay, params)
     }
 
-    private fun removeRegionOverlay() {
-        regionOverlay?.let {
+    private fun removeTranslationOverlay() {
+        activeOverlay?.let {
             if (it.isAttachedToWindow) windowManager.removeView(it)
         }
-        regionOverlay = null
-    }
-
-    private fun performTranslate(input: String, tvMeta: TextView, tvResult: TextView) {
-        tvResult.text = "正在联网查询..."
-        tvMeta.visibility = View.GONE
-        scope.launch {
-            val res = repository.translate(input, direction)
-            val metaParts = listOfNotNull(
-                res.phonetic?.let { "音标: $it" },
-                "来源: ${res.sourceLabel}"
-            )
-            tvMeta.text = metaParts.joinToString("  |  ")
-            tvMeta.visibility = View.VISIBLE
-            tvResult.text = res.translatedText
-        }
-    }
-
-    private fun showPanel() {
-        if (!panelView.isAttachedToWindow) {
-            bubbleView.visibility = View.GONE
-            windowManager.addView(panelView, panelParams)
-        }
-    }
-
-    private fun hidePanel() {
-        if (panelView.isAttachedToWindow) {
-            windowManager.removeView(panelView)
-            bubbleView.visibility = View.VISIBLE
-        }
+        activeOverlay = null
     }
 
     override fun onDestroy() {
         super.onDestroy()
         isRunning = false
         scope.cancel()
-        removeRegionOverlay()
+        removeTranslationOverlay()
         if (bubbleView.isAttachedToWindow) windowManager.removeView(bubbleView)
-        if (panelView.isAttachedToWindow) windowManager.removeView(panelView)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

@@ -13,20 +13,21 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="FloatTranslate 悬浮翻译"
+            android:text="FloatTranslate 全屏即点即译"
             android:textColor="#111827"
-            android:textSize="22sp"
+            android:textSize="21sp"
             android:textStyle="bold" />
 
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:text="支持节点读词 + 框选识图 OCR，免费接口开箱即用，支持自定义 API"
-            android:textColor="#6B7280"
+            android:layout_marginTop="6dp"
+            android:text="• 单击悬浮球：自动读取/自动全屏截图，直接在原文字位置覆盖显示译文（无弹窗、无需输入）
+• 长按悬浮球：切换「英→中 / 中→英」
+• 双击悬浮球：切换「节点读词 / 全屏识图」"
+            android:textColor="#374151"
             android:textSize="13sp" />
 
-        <!-- 权限与启动卡片 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -38,7 +39,7 @@
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="1. 权限配置"
+                android:text="1. 权限与启动（首次开启一次即可）"
                 android:textColor="#111827"
                 android:textSize="16sp"
                 android:textStyle="bold" />
@@ -48,21 +49,21 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="10dp"
-                android:text="授予悬浮窗权限" />
+                android:text="① 授予悬浮窗权限" />
 
             <Button
                 android:id="@+id/btnAccessibilityPerm"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="开启无障碍服务（节点/代码块读词）" />
+                android:text="② 开启无障碍服务（推荐：零弹窗直接读全屏节点+安卓11以上免授权静默截屏）" />
 
             <Button
                 android:id="@+id/btnScreenCapturePerm"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="授权截屏识图（框选 OCR 模式）" />
+                android:text="③ 备用：授予全屏截图权限（仅未开无障碍时使用）" />
 
             <Button
                 android:id="@+id/btnToggleFloating"
@@ -70,10 +71,9 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="14dp"
                 android:backgroundTint="#0F9D58"
-                android:text="启动悬浮球" />
+                android:text="启动全屏翻译悬浮球" />
         </LinearLayout>
 
-        <!-- 翻译引擎设置 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -85,7 +85,7 @@
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="2. 翻译引擎设置"
+                android:text="2. 联网翻译引擎设置"
                 android:textColor="#111827"
                 android:textSize="16sp"
                 android:textStyle="bold" />
@@ -101,13 +101,13 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:checked="true"
-                    android:text="免费公开接口（MyMemory + Free Dictionary）" />
+                    android:text="免费公开联网接口（Google GTX + MyMemory，免配置）" />
 
                 <RadioButton
                     android:id="@+id/rbCustomApi"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="自定义 API（OpenAI 兼容，适合复杂文献）" />
+                    android:text="自定义大模型 API（适合复杂文献）" />
             </RadioGroup>
 
             <LinearLayout
@@ -140,7 +140,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="6dp"
-                    android:hint="Model (例如 deepseek-chat / gpt-4o-mini)"
+                    android:hint="Model (例如 deepseek-chat)"
                     android:inputType="text"
                     android:textSize="13sp" />
             </LinearLayout>
@@ -150,34 +150,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="10dp"
-                android:text="保存引擎配置" />
-        </LinearLayout>
-
-        <!-- 最近查询历史 -->
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:background="@drawable/bg_floating_card"
-            android:orientation="vertical"
-            android:padding="16dp">
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="3. 最近翻译缓存"
-                android:textColor="#111827"
-                android:textSize="16sp"
-                android:textStyle="bold" />
-
-            <TextView
-                android:id="@+id/tvHistory"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:text="暂无缓存记录"
-                android:textColor="#374151"
-                android:textSize="13sp" />
+                android:text="保存配置" />
         </LinearLayout>
     </LinearLayout>
 </ScrollView>
