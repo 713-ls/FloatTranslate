@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">FloatTranslate</string>
+    <string name="accessibility_service_label">FloatTranslate 节点取词</string>
+    <string name="accessibility_service_desc">用于读取当前网页或应用中的文本与代码块，实现无截屏快速翻译。</string>
+</resources>
