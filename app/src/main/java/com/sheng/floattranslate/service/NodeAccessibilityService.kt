@@ -10,6 +10,7 @@ import android.view.accessibility.AccessibilityNodeInfo
 import com.sheng.floattranslate.model.ScreenTextBlock
 import com.sheng.floattranslate.util.TextCleaner
 import java.util.concurrent.Executor
+import kotlin.math.abs
 
 class NodeAccessibilityService : AccessibilityService() {
 
@@ -51,12 +52,12 @@ class NodeAccessibilityService : AccessibilityService() {
                 val rect = Rect()
                 node.getBoundsInScreen(rect)
                 if (rect.width() in 20..(screenWidth - 10) &&
-                    rect.height() in 16..450 &&
+                    rect.height() in 16..550 &&
                     rect.top in minContentTop..maxContentBottom &&
                     rect.left >= 0 && rect.right <= screenWidth
                 ) {
                     val keep = if (isEnToZh) {
-                        TextCleaner.shouldTranslate(text, true) || TextCleaner.hasChinese(text)
+                        TextCleaner.shouldTranslate(text, true)
                     } else {
                         TextCleaner.hasChinese(text) || TextCleaner.hasEnglishOrBlankHint(text)
                     }
@@ -75,7 +76,42 @@ class NodeAccessibilityService : AccessibilityService() {
         }
 
         traverse(root)
-        return blocks
+        return if (isEnToZh) mergeInlineAndAdjacentEnglishNodes(blocks) else blocks
+    }
+
+    /**
+     * 网页/小程序常把一句话里有绿色下划线的词（如 "The punishments" + "accorded" + "with the current code of discipline."）
+     * 拆成多个相邻的 Span 节点，导致一句话只翻了一半！这里把同一段落内同行或上下紧挨的英文节点自动拼接成完整句子。
+     */
+    private fun mergeInlineAndAdjacentEnglishNodes(raw: List<ScreenTextBlock>): List<ScreenTextBlock> {
+        if (raw.size <= 1) return raw
+        val sorted = raw.sortedWith(compareBy({ it.bounds.top / 45 }, { it.bounds.left }))
+        val merged = mutableListOf<ScreenTextBlock>()
+
+        for (item in sorted) {
+            val prev = merged.lastOrNull()
+            if (prev != null && !TextCleaner.hasChinese(prev.originalText) && !TextCleaner.hasChinese(item.originalText)) {
+                val sameLine = abs(item.bounds.centerY() - prev.bounds.centerY()) < 55
+                val nextLine = item.bounds.top - prev.bounds.bottom in -20..75
+                if (sameLine || nextLine) {
+                    val combined = if (prev.originalText.contains(item.originalText)) {
+                        prev.originalText
+                    } else {
+                        "${prev.originalText.trim()} ${item.originalText.trim()}"
+                    }
+                    val union = Rect(
+                        minOf(prev.bounds.left, item.bounds.left),
+                        minOf(prev.bounds.top, item.bounds.top),
+                        maxOf(prev.bounds.right, item.bounds.right),
+                        maxOf(prev.bounds.bottom, item.bounds.bottom)
+                    )
+                    merged[merged.lastIndex] = ScreenTextBlock(combined, union)
+                    continue
+                }
+            }
+            merged.add(item)
+        }
+        return merged
     }
 
     fun takeSilentFullScreenshot(

@@ -12,10 +12,6 @@ import android.view.MotionEvent
 import android.view.View
 import com.sheng.floattranslate.model.ScreenTextBlock
 
-/**
- * 原位覆盖翻译层：直接在原网页/PDF文字的坐标位置上绘制白底黑字译文，
- * 不弹任何输入框，轻触屏幕任意位置立即关闭译文层。
- */
 class FullScreenTranslationOverlay(
     context: Context,
     private val blocks: List<ScreenTextBlock>,
@@ -24,14 +20,14 @@ class FullScreenTranslationOverlay(
 ) : View(context) {
 
     private val boxBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(238, 255, 255, 255)
+        color = Color.argb(242, 255, 255, 255)
         style = Paint.Style.FILL
     }
 
     private val boxBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#93C5FD")
+        color = Color.parseColor("#3B82F6")
         style = Paint.Style.STROKE
-        strokeWidth = 2f
+        strokeWidth = 2.5f
     }
 
     private val textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -50,19 +46,26 @@ class FullScreenTranslationOverlay(
         textAlign = Paint.Align.CENTER
     }
 
+    private val screenOffset = IntArray(2)
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
+
+        // 获取当前覆盖层在物理屏幕上的真实起点偏移（消除状态栏/挖孔屏导致的 ~100px 向下偏移！）
+        getLocationOnScreen(screenOffset)
+        val offsetX = screenOffset[0].toFloat()
+        val offsetY = screenOffset[1].toFloat()
 
         for (b in blocks) {
             val text = b.translatedText.ifEmpty { b.originalText }
             val rect = b.bounds
             val pad = 8f
-            val boxWidth = (rect.width() + pad * 2).coerceAtLeast(120f)
+            val boxWidth = (rect.width() + pad * 2).coerceAtLeast(140f).coerceAtMost(width - 32f)
 
             textPaint.textSize = when {
                 rect.height() < 45 -> 28f
-                rect.height() > 110 -> 36f
-                else -> 32f
+                rect.height() > 120 -> 34f
+                else -> 31f
             }
 
             val staticLayout = StaticLayout.Builder
@@ -72,15 +75,18 @@ class FullScreenTranslationOverlay(
                 .build()
 
             val boxHeight = maxOf(rect.height().toFloat(), staticLayout.height + pad * 2)
+            val left = (rect.left - offsetX - pad).coerceAtLeast(12f)
+            val top = (rect.top - offsetY - pad).coerceAtLeast(12f)
+
             val drawRect = RectF(
-                rect.left - pad,
-                rect.top - pad,
-                rect.left - pad + boxWidth,
-                rect.top - pad + boxHeight
+                left,
+                top,
+                left + boxWidth,
+                top + boxHeight
             )
 
-            canvas.drawRoundRect(drawRect, 10f, 10f, boxBgPaint)
-            canvas.drawRoundRect(drawRect, 10f, 10f, boxBorderPaint)
+            canvas.drawRoundRect(drawRect, 12f, 12f, boxBgPaint)
+            canvas.drawRoundRect(drawRect, 12f, 12f, boxBorderPaint)
 
             canvas.save()
             canvas.translate(drawRect.left + pad, drawRect.top + pad)
@@ -88,11 +94,10 @@ class FullScreenTranslationOverlay(
             canvas.restore()
         }
 
-        // 顶部小胶囊提示：轻触屏幕任意处退出译文覆盖
         val pillW = 620f
         val pillH = 68f
         val pillLeft = (width - pillW) / 2f
-        val pillTop = 80f
+        val pillTop = (90f - offsetY).coerceAtLeast(24f)
         canvas.drawRoundRect(
             RectF(pillLeft, pillTop, pillLeft + pillW, pillTop + pillH),
             34f,
