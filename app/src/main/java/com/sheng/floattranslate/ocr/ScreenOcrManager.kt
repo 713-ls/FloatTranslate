@@ -13,6 +13,12 @@ import com.sheng.floattranslate.util.TextCleaner
 
 class ScreenOcrManager(private val context: Context) {
 
+    companion object {
+        private val UI_CHROME_WORDS = setOf(
+            "练习", "返回", "提交", "下一题", "确定", "完成", "跳过", "提示", "查看解析"
+        )
+    }
+
     private val recognizer = TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
 
     fun captureFullScreenAndRecognize(
@@ -38,6 +44,7 @@ class ScreenOcrManager(private val context: Context) {
         onSuccess: (List<ScreenTextBlock>) -> Unit,
         onError: (String) -> Unit
     ) {
+        val screenH = bitmap.height
         val input = InputImage.fromBitmap(bitmap, 0)
         recognizer.process(input)
             .addOnSuccessListener { visionText ->
@@ -46,10 +53,19 @@ class ScreenOcrManager(private val context: Context) {
                 for (block in visionText.textBlocks) {
                     val text = block.text.trim().replace("\n", " ")
                     val rect: Rect? = block.boundingBox
-                    if (rect != null && rect.top > 40 && TextCleaner.shouldTranslate(text, isEnToZh)) {
-                        list.add(ScreenTextBlock(text, rect))
+                    if (rect != null && rect.top in 220..(screenH - 120) &&
+                        text !in UI_CHROME_WORDS && !text.contains(".com")
+                    ) {
+                        val keep = if (isEnToZh) {
+                            TextCleaner.shouldTranslate(text, true)
+                        } else {
+                            TextCleaner.hasChinese(text) || TextCleaner.hasEnglishOrBlankHint(text)
+                        }
+                        if (keep) {
+                            list.add(ScreenTextBlock(text, rect))
+                        }
                     }
-                    if (list.size >= 35) break
+                    if (list.size >= 40) break
                 }
                 if (list.isEmpty()) {
                     onError("当前屏幕未识别到需要翻译的文字")
