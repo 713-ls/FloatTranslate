@@ -309,14 +309,16 @@ class TranslationRepository(context: Context) {
 
         // 组装最终显示的完整短语与补全提示
         val out = mutableListOf<ScreenTextBlock>()
-        if (bestWord != null) {
-            val fullPhrase = buildCompletedPhrase(enClueBlocks, hintBlock, prefix, bestWord)
-            if (hintBlock != null) {
+        val finalBestWord = bestWord
+        val finalHintBlock = hintBlock
+        if (finalBestWord != null) {
+            val fullPhrase = buildCompletedPhrase(enClueBlocks, finalHintBlock, prefix, finalBestWord)
+            if (finalHintBlock != null) {
                 out.add(
                     ScreenTextBlock(
-                        originalText = hintBlock.originalText,
-                        bounds = hintBlock.bounds,
-                        translatedText = "填入: $bestWord"
+                        originalText = finalHintBlock.originalText,
+                        bounds = finalHintBlock.bounds,
+                        translatedText = "填入: $finalBestWord"
                     )
                 )
             }
@@ -324,7 +326,7 @@ class TranslationRepository(context: Context) {
                 ScreenTextBlock(
                     originalText = zhBlock.originalText,
                     bounds = zhBlock.bounds,
-                    translatedText = "$chinesePrompt  ➔  $fullPhrase 【补全单词: $bestWord】"
+                    translatedText = "$chinesePrompt  ➔  $fullPhrase 【补全单词: $finalBestWord】"
                 )
             )
         } else {
