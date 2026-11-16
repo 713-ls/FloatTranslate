@@ -196,7 +196,7 @@ class FloatingTranslatorService : Service() {
         if (acc == null) {
             Toast.makeText(
                 this,
-                "请先在系统设置中开启「FloatTranslate 全屏自动取词」无障碍服务（若置灰请先在应用信息右上角点『允许受限制的设置』）",
+                "请先在系统设置中开启「FloatTranslate 全屏自动取词」无障碍服务",
                 Toast.LENGTH_LONG
             ).show()
             return
@@ -208,9 +208,19 @@ class FloatingTranslatorService : Service() {
         val isEnToZh = (direction == TranslateDirection.EN_TO_ZH)
         tvBubbleMode.text = "翻译中"
 
+        // 在「中→英」模式下，因为网页/小程序里的灰色填空提示（如 fun - - - -）和横线槽数需要高对比度截屏才能完整识别，
+        // 如果节点模式只抓到了 1 个英文词（漏掉了输入框里的灰色提示），自动无缝结合增强截屏 OCR！
         if (captureMode == CaptureMode.NODE) {
             val nodeBlocks = acc.collectScreenTextBlocks(isEnToZh)
-            if (nodeBlocks.isNotEmpty()) {
+            val hasEnoughClues = if (isEnToZh) {
+                nodeBlocks.isNotEmpty()
+            } else {
+                // 检查节点是否已经包含横线提示或下方多选按钮
+                val enCount = nodeBlocks.count { !it.originalText.any { ch -> ch in '\u4e00'..'\u9fa5' } }
+                val hasDashHint = nodeBlocks.any { it.originalText.contains("-") || it.originalText.contains("_") }
+                enCount >= 4 || hasDashHint
+            }
+            if (hasEnoughClues) {
                 translateAndRenderBlocks(nodeBlocks, "${direction.shortLabel}·节点")
                 return
             }

@@ -39,12 +39,11 @@ class NodeAccessibilityService : AccessibilityService() {
         val screenHeight = resources.displayMetrics.heightPixels
         val screenWidth = resources.displayMetrics.widthPixels
 
-        // 顶部状态栏+微信/网页导航栏高度约占屏幕前 16%，严格跳过顶部「< 返回」与「练习」
         val minContentTop = (screenHeight * 0.16f).toInt().coerceAtLeast(320)
         val maxContentBottom = (screenHeight * 0.88f).toInt()
 
         fun traverse(node: AccessibilityNodeInfo?) {
-            if (node == null || blocks.size >= 40) return
+            if (node == null || blocks.size >= 45) return
             if (node.packageName?.toString() == packageName) return
 
             val text = (node.text ?: node.hintText ?: node.contentDescription)?.toString()?.trim().orEmpty()
@@ -57,12 +56,12 @@ class NodeAccessibilityService : AccessibilityService() {
                     rect.left >= 0 && rect.right <= screenWidth
                 ) {
                     val keep = if (isEnToZh) {
-                        TextCleaner.shouldTranslate(text, true)
+                        TextCleaner.shouldTranslate(text, true) || TextCleaner.hasChinese(text)
                     } else {
                         TextCleaner.hasChinese(text) || TextCleaner.hasEnglishOrBlankHint(text)
                     }
                     if (keep) {
-                        val key = "${rect.top / 20}:${rect.left / 20}:${text.take(30)}"
+                        val key = "${rect.top / 20}:${rect.left / 20}:${text.take(35)}"
                         if (seenKeys.add(key)) {
                             blocks.add(ScreenTextBlock(text, rect))
                         }
