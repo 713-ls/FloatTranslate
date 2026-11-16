@@ -16,10 +16,6 @@ class NodeAccessibilityService : AccessibilityService() {
     companion object {
         var instance: NodeAccessibilityService? = null
             private set
-
-        private val UI_CHROME_WORDS = setOf(
-            "练习", "返回", "提交", "下一题", "确定", "完成", "跳过", "提示", "查看解析"
-        )
     }
 
     override fun onServiceConnected() {
@@ -36,11 +32,6 @@ class NodeAccessibilityService : AccessibilityService() {
         if (instance == this) instance = null
     }
 
-    /**
-     * 抓取当前屏幕所有可见文字节点与坐标。
-     * 在「中→英」模式下，同时抓取页面上的英文候选词与首字母提示（如 ext - - - -、observation、under），
-     * 以便自动完成选词组合与首字母补全单词。
-     */
     fun collectScreenTextBlocks(isEnToZh: Boolean): List<ScreenTextBlock> {
         val root = rootInActiveWindow ?: return emptyList()
         val blocks = mutableListOf<ScreenTextBlock>()
@@ -48,27 +39,30 @@ class NodeAccessibilityService : AccessibilityService() {
         val screenHeight = resources.displayMetrics.heightPixels
         val screenWidth = resources.displayMetrics.widthPixels
 
+        // 顶部状态栏+微信/网页导航栏高度约占屏幕前 16%，严格跳过顶部「< 返回」与「练习」
+        val minContentTop = (screenHeight * 0.16f).toInt().coerceAtLeast(320)
+        val maxContentBottom = (screenHeight * 0.88f).toInt()
+
         fun traverse(node: AccessibilityNodeInfo?) {
             if (node == null || blocks.size >= 40) return
             if (node.packageName?.toString() == packageName) return
 
             val text = (node.text ?: node.hintText ?: node.contentDescription)?.toString()?.trim().orEmpty()
-            if (text.isNotEmpty() && text !in UI_CHROME_WORDS && !text.contains(".com")) {
+            if (text.isNotEmpty() && !TextCleaner.isUiNoise(text)) {
                 val rect = Rect()
                 node.getBoundsInScreen(rect)
-                // 跳过顶部导航栏 (y < 240) 与底部按钮区
-                if (rect.width() > 20 && rect.height() > 16 &&
-                    rect.top in 220..(screenHeight - 120) &&
+                if (rect.width() in 20..(screenWidth - 10) &&
+                    rect.height() in 16..450 &&
+                    rect.top in minContentTop..maxContentBottom &&
                     rect.left >= 0 && rect.right <= screenWidth
                 ) {
                     val keep = if (isEnToZh) {
                         TextCleaner.shouldTranslate(text, true)
                     } else {
-                        // 中→英模式：既保留中文题目，也保留英文候选词和填空提示
                         TextCleaner.hasChinese(text) || TextCleaner.hasEnglishOrBlankHint(text)
                     }
                     if (keep) {
-                        val key = "${rect.top / 18}:${rect.left / 18}:${text.take(30)}"
+                        val key = "${rect.top / 20}:${rect.left / 20}:${text.take(30)}"
                         if (seenKeys.add(key)) {
                             blocks.add(ScreenTextBlock(text, rect))
                         }

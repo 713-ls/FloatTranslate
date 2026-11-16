@@ -13,12 +13,6 @@ import com.sheng.floattranslate.util.TextCleaner
 
 class ScreenOcrManager(private val context: Context) {
 
-    companion object {
-        private val UI_CHROME_WORDS = setOf(
-            "练习", "返回", "提交", "下一题", "确定", "完成", "跳过", "提示", "查看解析"
-        )
-    }
-
     private val recognizer = TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
 
     fun captureFullScreenAndRecognize(
@@ -45,30 +39,35 @@ class ScreenOcrManager(private val context: Context) {
         onError: (String) -> Unit
     ) {
         val screenH = bitmap.height
+        val minContentTop = (screenH * 0.16f).toInt().coerceAtLeast(320)
+        val maxContentBottom = (screenH * 0.88f).toInt()
+
         val input = InputImage.fromBitmap(bitmap, 0)
         recognizer.process(input)
             .addOnSuccessListener { visionText ->
                 bitmap.recycle()
                 val list = mutableListOf<ScreenTextBlock>()
                 for (block in visionText.textBlocks) {
-                    val text = block.text.trim().replace("\n", " ")
-                    val rect: Rect? = block.boundingBox
-                    if (rect != null && rect.top in 220..(screenH - 120) &&
-                        text !in UI_CHROME_WORDS && !text.contains(".com")
-                    ) {
-                        val keep = if (isEnToZh) {
-                            TextCleaner.shouldTranslate(text, true)
-                        } else {
-                            TextCleaner.hasChinese(text) || TextCleaner.hasEnglishOrBlankHint(text)
-                        }
-                        if (keep) {
-                            list.add(ScreenTextBlock(text, rect))
+                    for (line in block.lines) {
+                        val text = line.text.trim()
+                        val rect: Rect? = line.boundingBox
+                        if (rect != null &&
+                            rect.top in minContentTop..maxContentBottom &&
+                            !TextCleaner.isUiNoise(text)
+                        ) {
+                            val keep = if (isEnToZh) {
+                                TextCleaner.shouldTranslate(text, true)
+                            } else {
+                                TextCleaner.hasChinese(text) || TextCleaner.hasEnglishOrBlankHint(text)
+                            }
+                            if (keep) {
+                                list.add(ScreenTextBlock(text, rect))
+                            }
                         }
                     }
-                    if (list.size >= 40) break
                 }
                 if (list.isEmpty()) {
-                    onError("当前屏幕未识别到需要翻译的文字")
+                    onError("当前屏幕未识别到需要翻译的题目文字")
                 } else {
                     onSuccess(list)
                 }

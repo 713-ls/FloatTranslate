@@ -22,6 +22,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 
 class TranslationRepository(context: Context) {
     private val db = TranslationDbHelper(context)
@@ -42,9 +43,14 @@ class TranslationRepository(context: Context) {
             .build()
 
         private val customApiClient = OkHttpClient.Builder()
-            .connectTimeout(5, TimeUnit.SECONDS)
+            .connectTimeout(6, TimeUnit.SECONDS)
             .readTimeout(15, TimeUnit.SECONDS)
             .build()
+
+        private val GRAMMAR_STOP_WORDS = setOf(
+            "an", "a", "the", "of", "to", "in", "on", "at", "by", "for", "with", "from", "into",
+            "sb", "sth", "doing", "do", "one", "ones", "one's", "someone", "something"
+        )
     }
 
     private val concurrencyGate = Semaphore(12)
@@ -55,13 +61,14 @@ class TranslationRepository(context: Context) {
     ): List<ScreenTextBlock> = withContext(Dispatchers.IO) {
         if (blocks.isEmpty()) return@withContext emptyList()
 
-        // 在「中→英」模式下，先检测当前页面是否是“选词组合短语”或“首字母提示补全单词”题型
+        // 在「中→英」模式下，优先检测是否是词汇练习题（首字母补全单词 / 候选词组合短语）
         if (direction == TranslateDirection.ZH_TO_EN) {
             val solvedQuiz = trySolveZhToEnExercise(blocks)
-            if (solvedQuiz != null) return@withContext solvedQuiz
+            if (solvedQuiz != null && solvedQuiz.isNotEmpty()) {
+                return@withContext solvedQuiz
+            }
         }
 
-        // 常规全屏批量翻译（仅翻译对应方向的目标块）
         val targetBlocks = if (direction == TranslateDirection.ZH_TO_EN) {
             blocks.filter { TextCleaner.hasChinese(it.originalText) }
         } else {
@@ -114,162 +121,336 @@ class TranslationRepository(context: Context) {
     }
 
     /**
-     * 智能识别并解答「中→英」短语填空与选词组合题：
-     * 1. 首字母补全题（如：an [ext - - - -] species + 已灭绝的物种 -> 补全 extinct，显示完整短语 an extinct species）
-     * 2. 候选词组合题（如：在观察中 + [observation, observe, specimen, under] -> 组合为 under observation，并在对应词块标出点击顺序 ① ②）
+     * 智能识别并解答「中→英」短语填空与选词组合题
      */
     private suspend fun trySolveZhToEnExercise(blocks: List<ScreenTextBlock>): List<ScreenTextBlock>? {
         val zhBlocks = blocks.filter { TextCleaner.hasChinese(it.originalText) }
         val enBlocks = blocks.filter { !TextCleaner.hasChinese(it.originalText) && TextCleaner.hasEnglishOrBlankHint(it.originalText) }
 
-        if (zhBlocks.isEmpty() || enBlocks.isEmpty()) return null
+        if (zhBlocks.isEmpty()) return null
 
-        val mainZhBlock = zhBlocks.minByOrNull { it.bounds.top } ?: return null
+        // 选择正文中真正的中文题目（跳过顶部残留的短导航词，优先选 y > 380 的中文块）
+        val mainZhBlock = zhBlocks.firstOrNull { it.bounds.top > 380 } ?: zhBlocks.first()
         val chinesePrompt = mainZhBlock.originalText.trim()
 
-        // 如果开启了自定义大模型 API，优先直接让大模型结合页面给出的英文线索精准解答
-        if (prefs.useCustomApi && prefs.apiKey.isNotEmpty()) {
+        // 1. 若用户配置了自定义大模型 API，优先调用大模型一次性精准推理
+        if (prefs.useCustomApi && prefs.apiKey.isNotEmpty() && enBlocks.isNotEmpty()) {
             val llmSolved = solveExerciseWithCustomApi(chinesePrompt, mainZhBlock, enBlocks)
             if (llmSolved != null) return llmSolved
         }
 
-        // 判断题型 1：是否存在首字母填空提示（例如 "ext - - - -" 或同一水平线上有前缀短词）
-        val sameRowEn = enBlocks.filter { kotlin.math.abs(it.bounds.centerY() - mainZhBlock.bounds.top) < 350 && it.bounds.top < mainZhBlock.bounds.bottom }
+        // 2. 题型 A：中文题目上方（或同一水平高度）有首字母填空提示，例如：
+        // - "an  ext - - - -  species" (已灭绝的物种)
+        // - "obs - - - -  sb. doing sth." (看到某人正在做某事)
+        // - "obs - - - - - - - -" (观察)
+        // - "an  ar - - -  of ..." (大量......)
+        val upperOrSameRowEn = enBlocks.filter { it.bounds.top <= mainZhBlock.bounds.bottom + 60 }
             .sortedBy { it.bounds.left }
 
-        val explicitHintBlock = enBlocks.firstOrNull { TextCleaner.extractPrefixHint(it.originalText) != null }
-        if (explicitHintBlock != null || (sameRowEn.isNotEmpty() && enBlocks.size <= 3)) {
-            return solvePrefixCompletionFree(chinesePrompt, mainZhBlock, enBlocks, explicitHintBlock)
+        val candidateButtonsBelow = enBlocks.filter { it.bounds.top > mainZhBlock.bounds.bottom + 60 }
+
+        if (upperOrSameRowEn.isNotEmpty() && candidateButtonsBelow.size < 2) {
+            return solvePrefixCompletionFree(chinesePrompt, mainZhBlock, upperOrSameRowEn)
         }
 
-        // 判断题型 2：下方存在多个英文候选词按钮（如 observation / observe / specimen / under）
-        val candidateBlocks = enBlocks.filter { it.bounds.top > mainZhBlock.bounds.top }
-        if (candidateBlocks.size >= 2) {
-            return solveWordBankCombinationFree(chinesePrompt, mainZhBlock, candidateBlocks)
+        // 3. 题型 B：中文题目下方有多个英文候选按钮（如 observation / observe / specimen / under）
+        if (candidateButtonsBelow.size >= 2) {
+            return solveWordBankCombinationFree(chinesePrompt, mainZhBlock, candidateButtonsBelow)
         }
 
         return null
     }
 
     /**
-     * 题型 1（首字母补全单词）：例如「an  ext - - - -  species」+「已灭绝的物种」
+     * 免费模式下精准解答「首字母提示补全单词」：
+     * 结合 有道词典联想接口 (`dict.youdao.com/suggest`, 自带中英释义对照) + Datamuse 词库 + 整句机器翻译，
+     * 彻底解决机器翻译选词不一致（如把 observe 译成 see、把 array 译成 a lot of）和 OCR 漏识别提示字母的问题。
      */
     private suspend fun solvePrefixCompletionFree(
         chinesePrompt: String,
         zhBlock: ScreenTextBlock,
-        enBlocks: List<ScreenTextBlock>,
-        explicitHintBlock: ScreenTextBlock?
-    ): List<ScreenTextBlock> {
-        val sortedEn = enBlocks.sortedBy { it.bounds.left }
+        enClueBlocks: List<ScreenTextBlock>
+    ): List<ScreenTextBlock> = coroutineScope {
+        // 1. 提取页面上的首字母前缀块（如 "obs - - - -"、"obs iil"、"ar - - -"、"ext"）
+        var hintBlock: ScreenTextBlock? = null
+        var prefix = ""
+        var expectedLen: Int? = null
 
-        // 找出哪个块是待补全的 2~5 字母前缀
-        val targetHintBlock = explicitHintBlock ?: sortedEn.firstOrNull { b ->
-            val clean = b.originalText.replace(Regex("[^a-zA-Z]"), "").lowercase()
-            clean.length in 2..5 && clean !in setOf("an", "the", "to", "in", "on", "of", "at", "by", "for", "with", "from", "into")
-        }
-
-        val prefixPair = targetHintBlock?.let {
-            TextCleaner.extractPrefixHint(it.originalText)
-                ?: (it.originalText.replace(Regex("[^a-zA-Z]"), "").lowercase() to null)
-        }
-
-        // 1. 先把中文短语翻译为英文（免费接口）
-        val rawTranslatedList = batchTranslateFreeFast(listOf(chinesePrompt), TranslateDirection.ZH_TO_EN)
-        val rawEnPhrase = rawTranslatedList.firstOrNull()?.lowercase().orEmpty()
-        val translatedWords = Regex("[a-zA-Z]+").findAll(rawEnPhrase).map { it.value.lowercase() }.toList()
-
-        var completedWord: String? = null
-        if (prefixPair != null && prefixPair.first.isNotEmpty()) {
-            val prefix = prefixPair.first
-            val expectedLen = prefixPair.second
-
-            // A. 先看整句英译结果里是否直接包含以 prefix 开头的单词（如 "extinct species" -> "extinct"）
-            completedWord = translatedWords.firstOrNull { w ->
-                w.startsWith(prefix) && w.length > prefix.length && (expectedLen == null || w.length == expectedLen)
-            } ?: translatedWords.firstOrNull { w ->
-                w.startsWith(prefix) && w.length > prefix.length
-            }
-
-            // B. 若直接翻译用了同义词，调用 Datamuse 词汇联想接口 (`sp=ext*&ml=英文语境`) 精准补全以 prefix 开头的单词
-            if (completedWord == null) {
-                val contextWords = (translatedWords + sortedEn.mapNotNull {
-                    if (it == targetHintBlock) null else it.originalText.replace(Regex("[^a-zA-Z]"), "").lowercase()
-                }).filter { it.length > 2 && it != prefix }.distinct().joinToString(" ")
-
-                completedWord = queryDatamusePrefix(prefix, expectedLen, contextWords)
+        for (b in enClueBlocks) {
+            val extracted = TextCleaner.extractPrefixHint(b.originalText)
+            if (extracted != null) {
+                hintBlock = b
+                prefix = extracted.first
+                expectedLen = extracted.second
+                break
             }
         }
 
-        // 组装完整短语
-        val fullPhrase = if (completedWord != null && targetHintBlock != null) {
-            sortedEn.joinToString(" ") { b ->
-                if (b == targetHintBlock) completedWord else b.originalText.trim()
+        // 如果 OCR 只识别出了单个孤立前缀词（或把多个词拼在了一行，如 "an ar --- of ..." 或 "obs sb. doing sth."）
+        if (prefix.isEmpty()) {
+            for (b in enClueBlocks) {
+                val tokens = Regex("[a-zA-Z]{2,6}").findAll(b.originalText).map { it.value.lowercase() }.toList()
+                val candidatePrefix = tokens.firstOrNull { it !in GRAMMAR_STOP_WORDS }
+                if (candidatePrefix != null && candidatePrefix.length in 2..5) {
+                    hintBlock = b
+                    prefix = candidatePrefix
+                    break
+                }
             }
-        } else {
-            rawEnPhrase.ifEmpty { chinesePrompt }
         }
 
+        // 提取中文核心词（去掉“某人”、“正在”、“做某事”、“的”、“……”等虚词，用于和有道词典中文释义比对）
+        val cleanZhCore = chinesePrompt
+            .replace("某人", "")
+            .replace("某事", "")
+            .replace("正在", "")
+            .replace("做", "")
+            .replace(Regex("[.…。，、！？\\s]"), "")
+            .trim()
+
+        // 并发请求：
+        // (1) 有道词典前缀联想（返回以 prefix 开头的高频词及其精准中文释义）
+        // (2) 中文短语直接机器翻译
+        // (3) Datamuse 按长度/前缀查询候选词
+        val youdaoDeferred = async(Dispatchers.IO) {
+            if (prefix.isNotEmpty()) queryYoudaoPrefixCandidates(prefix) else emptyList()
+        }
+        val mtDeferred = async(Dispatchers.IO) {
+            batchTranslateFreeFast(listOf(chinesePrompt), TranslateDirection.ZH_TO_EN)
+                .firstOrNull()?.lowercase().orEmpty()
+        }
+        val datamuseDeferred = async(Dispatchers.IO) {
+            if (prefix.isNotEmpty()) queryDatamusePrefixList(prefix, expectedLen) else emptyList()
+        }
+
+        val youdaoList = youdaoDeferred.await() // List<Pair<word, chineseExplain>>
+        val mtPhrase = mtDeferred.await()
+        val datamuseWords = datamuseDeferred.await()
+
+        var bestWord: String? = null
+
+        if (prefix.isNotEmpty()) {
+            // 优先级 1：从有道词典前缀联想结果中，匹配中文释义与题目中文重合度最高且满足长度的单词！
+            // 例如：
+            // - prefix="obs", 题目="看到某人正在做某事"(含"看"/"观察") -> 有道返回 observe ("vt. 观察；看到；注意到") 满分命中！
+            // - prefix="obs", 题目="观察"(名词/动词，且横线长) -> observation ("n. 观察；观测") / observe 命中！
+            // - prefix="ar", 题目="大量……" + 上下文 "an ___ of" -> array ("n. 大量；一系列；数组") 满分命中！
+            // - prefix="ext", 题目="已灭绝的物种" -> extinct ("adj. 灭绝的；绝种的") 满分命中！
+            var bestScore = -1
+            val allClueText = enClueBlocks.joinToString(" ") { it.originalText.lowercase() }
+
+            for ((word, explain) in youdaoList) {
+                if (!word.startsWith(prefix) || word.contains(" ") || word.contains("-")) continue
+                var score = 0
+
+                // 检查中文题目字词是否出现在词典释义中
+                val checkTarget = if (cleanZhCore.isNotEmpty()) cleanZhCore else chinesePrompt
+                for (ch in checkTarget) {
+                    if (ch in explain) score += 10
+                }
+                // 常见同义释义映射（如题目写“看到”，词典写“观察/注意到”；题目写“大量”，词典写“一系列/大批/数组”）
+                if (chinesePrompt.contains("看") && (explain.contains("观察") || explain.contains("注意") || explain.contains("看"))) {
+                    score += 25
+                }
+                if (chinesePrompt.contains("大量") && (explain.contains("大量") || explain.contains("一系列") || explain.contains("大批") || word == "array")) {
+                    score += 30
+                }
+
+                // 结合页面语法线索加分：
+                // 如 "sb. doing" 需要动词原形/及物动词 (vt./v.)，排除名词 observation
+                if (allClueText.contains("doing") || allClueText.contains("sb")) {
+                    if (explain.contains("vt.") || explain.contains("vi.") || explain.contains("v.")) score += 15
+                    if (word.endsWith("tion") || word.endsWith("ment")) score -= 20
+                }
+                // 如 "an ___ of" 需要可数名词单数 (n.)
+                if (allClueText.contains("an ") && allClueText.contains("of")) {
+                    if (explain.contains("n.")) score += 15
+                }
+
+                // 如果横线长度明确，优先匹配长度接近的词
+                if (expectedLen != null) {
+                    val diff = abs(word.length - expectedLen)
+                    if (diff == 0) score += 18
+                    else if (diff == 1) score += 8
+                    else score -= diff * 4
+                }
+
+                if (score > bestScore) {
+                    bestScore = score
+                    bestWord = word
+                }
+            }
+
+            // 优先级 2：检查整句机器翻译里是否直接有以 prefix 开头的词
+            if (bestWord == null || bestScore <= 0) {
+                val mtWords = Regex("[a-zA-Z]+").findAll(mtPhrase).map { it.value.lowercase() }.toList()
+                val mtMatch = mtWords.firstOrNull { it.startsWith(prefix) && it.length > prefix.length }
+                if (mtMatch != null) bestWord = mtMatch
+            }
+
+            // 优先级 3：如果仍未命中，将 Datamuse 候选词并发翻译成中文做二次比对
+            if (bestWord == null && datamuseWords.isNotEmpty()) {
+                val topCandidates = datamuseWords.take(6)
+                val candZhList = batchTranslateFreeFast(topCandidates, TranslateDirection.EN_TO_ZH)
+                var dmBestScore = -1
+                topCandidates.forEachIndexed { idx, w ->
+                    val zh = candZhList.getOrNull(idx).orEmpty()
+                    var s = 0
+                    for (ch in chinesePrompt) {
+                        if (ch in zh) s += 10
+                    }
+                    if (s > dmBestScore) {
+                        dmBestScore = s
+                        bestWord = w
+                    }
+                }
+            }
+        }
+
+        // 组装最终显示的完整短语与补全提示
         val out = mutableListOf<ScreenTextBlock>()
-        if (completedWord != null && targetHintBlock != null) {
+        if (bestWord != null) {
+            val fullPhrase = buildCompletedPhrase(enClueBlocks, hintBlock, prefix, bestWord)
+            if (hintBlock != null) {
+                out.add(
+                    ScreenTextBlock(
+                        originalText = hintBlock.originalText,
+                        bounds = hintBlock.bounds,
+                        translatedText = "填入: $bestWord"
+                    )
+                )
+            }
             out.add(
                 ScreenTextBlock(
-                    originalText = targetHintBlock.originalText,
-                    bounds = targetHintBlock.bounds,
-                    translatedText = "补全: $completedWord"
+                    originalText = zhBlock.originalText,
+                    bounds = zhBlock.bounds,
+                    translatedText = "$chinesePrompt  ➔  $fullPhrase 【补全单词: $bestWord】"
+                )
+            )
+        } else {
+            // 即使 OCR 完全没拍到浅灰色前缀（比如只拍到了 "sb. doing sth." 和 "看到某人正在做某事"），
+            // 也利用有道词典查询中文短语给出地道英文搭配，绝不空白无输出！
+            val youdaoPhrase = queryYoudaoChineseToEnglishPhrase(chinesePrompt, cleanZhCore)
+            val displayEn = youdaoPhrase.ifEmpty { mtPhrase.ifEmpty { "请双击悬浮球切换节点/识图重试" } }
+            out.add(
+                ScreenTextBlock(
+                    originalText = zhBlock.originalText,
+                    bounds = zhBlock.bounds,
+                    translatedText = "$chinesePrompt  ➔  $displayEn"
                 )
             )
         }
-        out.add(
-            ScreenTextBlock(
-                originalText = zhBlock.originalText,
-                bounds = zhBlock.bounds,
-                translatedText = if (completedWord != null) {
-                    "$chinesePrompt  ➔  $fullPhrase （填入: $completedWord）"
-                } else {
-                    "$chinesePrompt  ➔  $fullPhrase"
-                }
-            )
-        )
-        return out
+
+        out
+    }
+
+    private fun buildCompletedPhrase(
+        enClueBlocks: List<ScreenTextBlock>,
+        hintBlock: ScreenTextBlock?,
+        prefix: String,
+        completedWord: String
+    ): String {
+        if (enClueBlocks.isEmpty()) return completedWord
+        return enClueBlocks.joinToString(" ") { b ->
+            if (b == hintBlock) {
+                // 如果该块里除了前缀还有别的词（如 "an ar - - - of ..."），只替换前缀部分
+                val replaced = b.originalText.replace(
+                    Regex("\\b$prefix\\s*[-_iIl1\\s.]*", RegexOption.IGNORE_CASE),
+                    "$completedWord "
+                ).trim()
+                if (replaced.contains(completedWord, ignoreCase = true)) replaced else completedWord
+            } else {
+                b.originalText.trim()
+            }
+        }.replace(Regex("\\s+"), " ").trim()
     }
 
     /**
-     * 调用公开免费的 Datamuse 词库 API，根据首字母前缀 (`ext*`) 与上下文含义补全完整英文单词
+     * 调用有道词典公开免费的 Suggest 接口，获取以 prefix 开头的英文单词列表及其真实中文释义
      */
-    private fun queryDatamusePrefix(prefix: String, expectedLen: Int?, contextMeaning: String): String? {
+    private fun queryYoudaoPrefixCandidates(prefix: String): List<Pair<String, String>> {
+        val results = mutableListOf<Pair<String, String>>()
+        try {
+            val encoded = URLEncoder.encode(prefix, "UTF-8")
+            val url = "https://dict.youdao.com/suggest?num=25&ver=3.0&doctype=json&cache=false&le=en&q=$encoded"
+            val req = Request.Builder()
+                .url(url)
+                .header("User-Agent", "Mozilla/5.0")
+                .get()
+                .build()
+            val bodyStr = fastClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return emptyList()
+                resp.body?.string().orEmpty()
+            }
+            val entries = JSONObject(bodyStr).optJSONObject("data")?.optJSONArray("entries") ?: return emptyList()
+            for (i in 0 until entries.length()) {
+                val item = entries.getJSONObject(i)
+                val entry = item.optString("entry").trim().lowercase()
+                val explain = item.optString("explain").trim()
+                if (entry.isNotEmpty() && explain.isNotEmpty()) {
+                    results.add(entry to explain)
+                }
+            }
+        } catch (_: Exception) {}
+        return results
+    }
+
+    /**
+     * 当 OCR 漏掉浅灰色首字母时，直接查有道词典中文词条获取常见英文短语搭配
+     */
+    private fun queryYoudaoChineseToEnglishPhrase(fullZh: String, coreZh: String): String {
+        val queries = listOf(fullZh, coreZh).filter { it.isNotEmpty() }.distinct()
+        val found = mutableListOf<String>()
+        for (q in queries) {
+            try {
+                val encoded = URLEncoder.encode(q, "UTF-8")
+                val url = "https://dict.youdao.com/suggest?num=6&ver=3.0&doctype=json&cache=false&le=en&q=$encoded"
+                val req = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").get().build()
+                val bodyStr = fastClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) "" else resp.body?.string().orEmpty()
+                }
+                if (bodyStr.isNotEmpty()) {
+                    val entries = JSONObject(bodyStr).optJSONObject("data")?.optJSONArray("entries")
+                    if (entries != null) {
+                        for (i in 0 until minOf(3, entries.length())) {
+                            val explain = entries.getJSONObject(i).optString("explain")
+                            if (explain.isNotEmpty()) found.add(explain)
+                        }
+                    }
+                }
+                if (found.isNotEmpty()) break
+            } catch (_: Exception) {}
+        }
+        return found.joinToString(" / ")
+    }
+
+    private fun queryDatamusePrefixList(prefix: String, expectedLen: Int?): List<String> {
         return try {
             val pattern = if (expectedLen != null && expectedLen > prefix.length) {
                 prefix + "?".repeat(expectedLen - prefix.length)
             } else {
                 "$prefix*"
             }
-            val mlParam = if (contextMeaning.isNotEmpty()) {
-                "&ml=${URLEncoder.encode(contextMeaning, "UTF-8")}"
-            } else ""
-            val url = "https://api.datamuse.com/words?sp=$pattern$mlParam&max=8"
+            val url = "https://api.datamuse.com/words?sp=$pattern&max=12"
             val req = Request.Builder().url(url).get().build()
             val bodyStr = fastClient.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return null
+                if (!resp.isSuccessful) return emptyList()
                 resp.body?.string().orEmpty()
             }
             val arr = JSONArray(bodyStr)
-            if (arr.length() > 0) {
-                return arr.getJSONObject(0).optString("word").takeIf { it.isNotEmpty() }
+            val list = mutableListOf<String>()
+            for (i in 0 until arr.length()) {
+                val w = arr.getJSONObject(i).optString("word")
+                if (w.isNotEmpty()) list.add(w)
             }
-            // 若严格字数未命中，放宽为 prefix* 再查一次
-            if (expectedLen != null) {
-                return queryDatamusePrefix(prefix, null, contextMeaning)
-            }
-            null
+            list
         } catch (_: Exception) {
-            null
+            emptyList()
         }
     }
 
     /**
-     * 题型 2（用页面给定的英文单词组合成对应中文短语）：
-     * 例如中文「在观察中」，候选词 [observation, observe, specimen, under] -> 自动组合出 "under observation"，
-     * 并在候选词按钮原位标出 ① under、② observation 的点击顺序！
+     * 题型 2：用页面给定的英文候选单词组合成对应中文短语（并标出 ① ② 顺序）
      */
     private suspend fun solveWordBankCombinationFree(
         chinesePrompt: String,
@@ -278,13 +459,11 @@ class TranslationRepository(context: Context) {
     ): List<ScreenTextBlock> = coroutineScope {
         val candidates = candidateBlocks.map { it.originalText.trim() }
 
-        // 并发请求：1. 中文短语的直接英译；2. 所有两词组合（或候选词本身）的中文含义校对
         val directEnDeferred = async(Dispatchers.IO) {
             batchTranslateFreeFast(listOf(chinesePrompt), TranslateDirection.ZH_TO_EN)
                 .firstOrNull()?.lowercase().orEmpty()
         }
 
-        // 生成由候选词构成的合理短语组合（2词组合优先，如 "under observation"）
         val pairPhrases = mutableListOf<List<Int>>()
         for (i in candidates.indices) {
             for (j in candidates.indices) {
@@ -295,7 +474,6 @@ class TranslationRepository(context: Context) {
         val directEn = directEnDeferred.await()
         val directTokens = Regex("[a-zA-Z]+").findAll(directEn).map { it.value.lowercase() }.toList()
 
-        // 策略 A：如果直接英译出来的词恰好都在候选池里（如 directEn = "under observation"），直接精确匹配
         val exactIndices = mutableListOf<Int>()
         for (tok in directTokens) {
             val matchIdx = candidates.indexOfFirst { it.equals(tok, ignoreCase = true) }
@@ -307,7 +485,6 @@ class TranslationRepository(context: Context) {
         val chosenIndices: List<Int> = if (exactIndices.size >= 2) {
             exactIndices
         } else {
-            // 策略 B：把候选词构成的组合并发翻译回中文，挑选与题目中文重合度最高的一组
             val comboStrings = pairPhrases.map { idxList -> idxList.joinToString(" ") { candidates[it] } }
             val comboZhList = batchTranslateFreeFast(comboStrings, TranslateDirection.EN_TO_ZH)
 
@@ -318,18 +495,15 @@ class TranslationRepository(context: Context) {
                 val zhTrans = comboZhList.getOrNull(pairIdx).orEmpty()
                 val comboEn = comboStrings[pairIdx].lowercase()
                 var score = 0
-                // 字符重合分
                 for (ch in chinesePrompt) {
                     if (ch in zhTrans) score += 3
                 }
                 if (zhTrans == chinesePrompt) score += 10
-                // 英文词根重合分
                 for (tok in directTokens) {
                     if (tok.length >= 3 && comboEn.contains(tok.take(4))) score += 4
                 }
-                // 介词开头加分（英语短语常见 under / in / on / at / by / with + 名词）
                 val firstWord = candidates[idxList[0]].lowercase()
-                if (firstWord in setOf("under", "in", "on", "at", "by", "for", "with", "Beyond", "without", "beyond", "within", "out", "from", "to")) {
+                if (firstWord in setOf("under", "in", "on", "at", "by", "for", "with", "without", "beyond", "within", "out", "from", "to")) {
                     score += 2
                 }
                 if (score > bestScore) {
@@ -344,7 +518,6 @@ class TranslationRepository(context: Context) {
         val orderBadges = arrayOf("①", "②", "③", "④", "⑤", "⑥")
 
         val outputBlocks = mutableListOf<ScreenTextBlock>()
-        // 在中文题目位置直接显示组合好的英文短语答案
         outputBlocks.add(
             ScreenTextBlock(
                 originalText = zhBlock.originalText,
@@ -353,7 +526,6 @@ class TranslationRepository(context: Context) {
             )
         )
 
-        // 在被选中的英文单词按钮上直接标出点击顺序 ①、②
         chosenIndices.forEachIndexed { orderIdx, candIdx ->
             val b = candidateBlocks[candIdx]
             val badge = orderBadges.getOrElse(orderIdx) { "${orderIdx + 1}." }
@@ -369,9 +541,6 @@ class TranslationRepository(context: Context) {
         outputBlocks
     }
 
-    /**
-     * 若用户开启了自定义大模型 API，一步到位同时支持「选词组合」与「首字母补全单词」
-     */
     private fun solveExerciseWithCustomApi(
         chinesePrompt: String,
         zhBlock: ScreenTextBlock,
@@ -382,7 +551,7 @@ class TranslationRepository(context: Context) {
             val enClues = enBlocks.sortedBy { it.bounds.top * 1000 + it.bounds.left }
                 .joinToString(" | ") { it.originalText.trim() }
 
-            val prompt = "这是一个英语短语练习页面，中文题目：「$chinesePrompt」，页面上的英文线索或候选词：「$enClues」。1. 若英文线索含首字母前缀（如 an | ext - - - - | species），请根据中文补全该单词并输出完整短语；2. 若英文线索是多个候选单词（如 observation | observe | specimen | under），请严格用候选词组合出对应中文题目的英文短语。只输出一行最终英文短语，不要多余解释。" 
+            val prompt = "这是一个英语词汇练习页面，中文题目：「$chinesePrompt」，页面上的英文线索或候选词：「$enClues」。1. 若英文线索含首字母前缀（如 an | ext - - - - | species 或 obs - - - - | sb. doing sth. 或 an | ar - - - | of ...），请根据中文和固定搭配补全该单词并输出完整英文短语（并在括号内注明填入的完整单词）；2. 若英文线索是多个候选单词，请严格用候选词组合出对应中文题目的英文短语。只输出一行结果，不要多余解释。"
 
             val payload = JSONObject().apply {
                 put("model", prefs.modelName)
@@ -428,7 +597,6 @@ class TranslationRepository(context: Context) {
                 )
             )
 
-            // 如果页面下方有候选词按钮，顺便把命中的词按顺序标上 ① ②
             val answerWords = Regex("[a-zA-Z]+").findAll(answer).map { it.value.lowercase() }.toList()
             val orderBadges = arrayOf("①", "②", "③", "④", "⑤")
             var step = 0
